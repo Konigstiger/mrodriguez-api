@@ -83,7 +83,7 @@ public static class GetCv
             }
 
             string containerName = Environment.GetEnvironmentVariable("CV_CONTAINER") ?? "resume";
-            string blobName = Environment.GetEnvironmentVariable("CV_BLOB_NAME") ?? "[CV]Mariano-Rodriguez-2025.pdf";
+            string blobName = Environment.GetEnvironmentVariable("CV_BLOB_NAME") ?? "[CV]Mariano-Rodriguez.pdf";
 
             var blobService = new BlobServiceClient(blobConn);
             var container = blobService.GetBlobContainerClient(containerName);
