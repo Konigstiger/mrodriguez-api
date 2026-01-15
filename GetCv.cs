@@ -16,8 +16,6 @@ public sealed class GetCv
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly IConfiguration _config;
 
-    private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
-
     public GetCv(
         ILogger<GetCv> logger,
         BlobServiceClient blobServiceClient,
@@ -31,105 +29,35 @@ public sealed class GetCv
     }
 
     private sealed record TurnstileRequest(string Token);
-    private sealed record TurnstileVerifyResponse(bool Success, string[]? ErrorCodes);
 
     [Function("GetCv")]
     public async Task<HttpResponseData> Run(
         [HttpTrigger(AuthorizationLevel.Anonymous, "post", Route = "cv")] HttpRequestData req)
     {
+        _logger.LogInformation("GetCv triggered.");
+
         try
         {
-            // 1) Parse body: { "token": "..." }
-            var body = await new StreamReader(req.Body, Encoding.UTF8).ReadToEndAsync();
-            if (string.IsNullOrWhiteSpace(body))
-                return CreateText(req, HttpStatusCode.BadRequest, "Missing request body.");
-
-            TurnstileRequest? turnstileRequest;
-            try
-            {
-                // Accept both { token: "x" } and { Token: "x" }
-                using var doc = JsonDocument.Parse(body);
-                var root = doc.RootElement;
-
-                var token =
-                    root.TryGetProperty("token", out var t1) ? t1.GetString() :
-                    root.TryGetProperty("Token", out var t2) ? t2.GetString() :
-                    null;
-
-                if (string.IsNullOrWhiteSpace(token))
-                    return CreateText(req, HttpStatusCode.BadRequest, "Missing Turnstile token.");
-
-                turnstileRequest = new TurnstileRequest(token);
-            }
-            catch (JsonException)
-            {
-                return CreateText(req, HttpStatusCode.BadRequest, "Invalid JSON body.");
-            }
+            // 1) Parse Turnstile token
+            var token = await ReadTurnstileToken(req);
+            if (token is null)
+                return CreateText(req, HttpStatusCode.BadRequest, "Missing or invalid Turnstile token.");
 
             // 2) Verify Turnstile
-            var secret = _config["TURNSTILE_SECRET"];
-            if (string.IsNullOrWhiteSpace(secret))
+            if (!await VerifyTurnstileAsync(token))
+                return CreateText(req, HttpStatusCode.Forbidden, "Captcha verification failed.");
+
+            // 3) Read configuration
+            var containerName = _config["CV_CONTAINER"];
+            var blobName = _config["CV_BLOB_NAME"];
+
+            if (string.IsNullOrWhiteSpace(containerName) || string.IsNullOrWhiteSpace(blobName))
             {
-                _logger.LogError("TURNSTILE_SECRET is not configured.");
+                _logger.LogError("CV_CONTAINER or CV_BLOB_NAME not configured.");
                 return CreateText(req, HttpStatusCode.InternalServerError, "Server misconfiguration.");
             }
 
-            var http = _httpClientFactory.CreateClient("turnstile");
-
-            using var form = new FormUrlEncodedContent(new[]
-            {
-                new KeyValuePair<string,string>("secret", secret),
-                new KeyValuePair<string,string>("response", turnstileRequest.Token),
-            });
-
-            using var verify = await http.PostAsync(
-                "https://challenges.cloudflare.com/turnstile/v0/siteverify",
-                form);
-
-            if (!verify.IsSuccessStatusCode)
-            {
-                _logger.LogWarning("Turnstile verify HTTP {StatusCode}.", verify.StatusCode);
-                return CreateText(req, HttpStatusCode.BadGateway, "Captcha verification unavailable.");
-            }
-
-            var verifyJson = await verify.Content.ReadAsStringAsync();
-            TurnstileVerifyResponse? verifyObj;
-
-            try
-            {
-                // Cloudflare uses snake_case; JsonDefaults.Web + these property names handle typical cases,
-                // but we’ll also handle both keys safely if needed.
-                using var doc = JsonDocument.Parse(verifyJson);
-                var root = doc.RootElement;
-
-                var success = root.TryGetProperty("success", out var s) && s.GetBoolean();
-
-                string[]? errorCodes = null;
-                if (root.TryGetProperty("error-codes", out var e1) && e1.ValueKind == JsonValueKind.Array)
-                    errorCodes = e1.EnumerateArray().Select(x => x.GetString() ?? "").Where(x => x.Length > 0).ToArray();
-                else if (root.TryGetProperty("error_codes", out var e2) && e2.ValueKind == JsonValueKind.Array)
-                    errorCodes = e2.EnumerateArray().Select(x => x.GetString() ?? "").Where(x => x.Length > 0).ToArray();
-
-                verifyObj = new TurnstileVerifyResponse(success, errorCodes);
-            }
-            catch (JsonException)
-            {
-                _logger.LogWarning("Turnstile verify returned invalid JSON.");
-                return CreateText(req, HttpStatusCode.BadGateway, "Captcha verification failed.");
-            }
-
-            if (verifyObj is null || !verifyObj.Success)
-            {
-                _logger.LogInformation("Turnstile failed. Codes: {Codes}", verifyObj?.ErrorCodes is null
-                    ? "(none)"
-                    : string.Join(",", verifyObj.ErrorCodes));
-                return CreateText(req, HttpStatusCode.Forbidden, "Captcha verification failed.");
-            }
-
-            // 3) Stream CV from Blob
-            var containerName = _config["CV_CONTAINER"] ?? "resume";
-            var blobName = _config["CV_BLOB_NAME"] ?? "[CV]Mariano-Rodriguez.pdf";
-
+            // 4) Fetch blob
             var container = _blobServiceClient.GetBlobContainerClient(containerName);
             var blob = container.GetBlobClient(blobName);
 
@@ -139,6 +67,7 @@ public sealed class GetCv
                 return CreateText(req, HttpStatusCode.NotFound, "CV not found.");
             }
 
+            // 5) Stream PDF
             var response = req.CreateResponse(HttpStatusCode.OK);
             response.Headers.Add("Content-Type", "application/pdf");
             response.Headers.Add("Content-Disposition", $"inline; filename=\"{blobName}\"");
@@ -151,6 +80,69 @@ public sealed class GetCv
         {
             _logger.LogError(ex, "GetCv failed.");
             return CreateText(req, HttpStatusCode.InternalServerError, "Internal server error.");
+        }
+    }
+
+    // ---------- Helpers ----------
+
+    private async Task<string?> ReadTurnstileToken(HttpRequestData req)
+    {
+        var body = await new StreamReader(req.Body, Encoding.UTF8).ReadToEndAsync();
+        if (string.IsNullOrWhiteSpace(body))
+            return null;
+
+        try
+        {
+            using var doc = JsonDocument.Parse(body);
+            var root = doc.RootElement;
+
+            return
+                root.TryGetProperty("token", out var t1) ? t1.GetString() :
+                root.TryGetProperty("Token", out var t2) ? t2.GetString() :
+                null;
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
+
+    private async Task<bool> VerifyTurnstileAsync(string token)
+    {
+        var secret = _config["TURNSTILE_SECRET"];
+        if (string.IsNullOrWhiteSpace(secret))
+        {
+            _logger.LogError("TURNSTILE_SECRET not configured.");
+            return false;
+        }
+
+        var http = _httpClientFactory.CreateClient("turnstile");
+
+        using var form = new FormUrlEncodedContent(new[]
+        {
+            new KeyValuePair<string, string>("secret", secret),
+            new KeyValuePair<string, string>("response", token)
+        });
+
+        using var response = await http.PostAsync(
+            "https://challenges.cloudflare.com/turnstile/v0/siteverify",
+            form);
+
+        if (!response.IsSuccessStatusCode)
+        {
+            _logger.LogWarning("Turnstile HTTP failure: {Status}", response.StatusCode);
+            return false;
+        }
+
+        try
+        {
+            using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+            return doc.RootElement.TryGetProperty("success", out var s) && s.GetBoolean();
+        }
+        catch (JsonException)
+        {
+            _logger.LogWarning("Invalid Turnstile JSON response.");
+            return false;
         }
     }
 
