@@ -1,12 +1,26 @@
+﻿using Azure.Core.Serialization;
 using Azure.Storage.Blobs;
+using Microsoft.Azure.Functions.Worker;
 using Microsoft.Azure.Functions.Worker.Builder;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using System.Text.Json;
 
 var builder = FunctionsApplication.CreateBuilder(args);
 
 builder.ConfigureFunctionsWebApplication();
+
+// ✅ Ensure JSON output uses camelCase (matches your frontend types.ts)
+builder.Services.Configure<WorkerOptions>(options =>
+{
+    options.Serializer = new JsonObjectSerializer(new JsonSerializerOptions
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        // Optional but often useful:
+        // PropertyNameCaseInsensitive = true
+    });
+});
 
 // Add configuration sources (local.settings.json is loaded by Functions runtime for local dev)
 builder.Services.AddOptions();
